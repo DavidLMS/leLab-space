@@ -12,6 +12,7 @@ import NgrokConfigModal from "@/components/landing/NgrokConfigModal";
 import { Action } from "@/components/landing/types";
 import UsageInstructionsModal from "@/components/landing/UsageInstructionsModal";
 import DirectFollowerModal from "@/components/landing/DirectFollowerModal";
+import { CameraConfig } from "@/components/recording/CameraConfiguration";
 import { useApi } from "@/contexts/ApiContext";
 
 const Landing = () => {
@@ -51,6 +52,10 @@ const Landing = () => {
     "/dev/tty.usbmodem5A460816621"
   );
   const [directFollowerConfig, setDirectFollowerConfig] = useState("");
+
+  // Camera state for all modals
+  const [teleoperationCameras, setTeleoperationCameras] = useState<CameraConfig[]>([]);
+  const [recordingCameras, setRecordingCameras] = useState<CameraConfig[]>([]);
 
   const navigate = useNavigate();
   const { toast } = useToast();
@@ -292,10 +297,17 @@ const Landing = () => {
       color: "bg-yellow-500 hover:bg-yellow-600",
     },
     {
+      title: "Record Dataset",
+      description: "Record episodes for training data.",
+      handler: handleRecordingClick,
+      color: "bg-red-500 hover:bg-red-600",
+    },
+    {
       title: "Direct Follower Control",
-      description: "Train a model on your datasets.",
+      description: "Control robot arm with mouse movements.",
       handler: handleDirectFollowerClick,
       color: "bg-blue-500 hover:bg-blue-600",
+      isWorkInProgress: true,
     },
     {
       title: "Calibration",
@@ -303,12 +315,6 @@ const Landing = () => {
       handler: handleCalibrationClick,
       color: "bg-indigo-500 hover:bg-indigo-600",
       isWorkInProgress: true,
-    },
-    {
-      title: "Record Dataset",
-      description: "Record episodes for training data.",
-      handler: handleRecordingClick,
-      color: "bg-red-500 hover:bg-red-600",
     },
     {
       title: "Training",
@@ -367,6 +373,8 @@ const Landing = () => {
         setFollowerConfig={setFollowerConfig}
         leaderConfigs={leaderConfigs}
         followerConfigs={followerConfigs}
+        cameras={teleoperationCameras}
+        setCameras={setTeleoperationCameras}
         isLoadingConfigs={isLoadingConfigs}
         onStart={handleStartTeleoperation}
       />
@@ -390,6 +398,8 @@ const Landing = () => {
         setSingleTask={setSingleTask}
         numEpisodes={numEpisodes}
         setNumEpisodes={setNumEpisodes}
+        cameras={recordingCameras}
+        setCameras={setRecordingCameras}
         isLoadingConfigs={isLoadingConfigs}
         onStart={handleStartRecording}
       />
