@@ -12,7 +12,7 @@ import {
 
 export class WebRTCManager extends BrowserEventEmitter {
   public config: WebRTCManagerConfig;
-  private signalingSocket: WebSocket | null = null;
+  private signalingSocket: any = null; // Socket.IO client
   private sources = new Map<string, UnifiedCameraSource>();
   private isConnected = false;
   private reconnectAttempts = 0;
@@ -35,6 +35,7 @@ export class WebRTCManager extends BrowserEventEmitter {
     try {
       console.log('🔗 Connecting to WebRTC signaling server:', this.config.signalingUrl);
       
+      // Use native WebSocket instead of Socket.IO
       this.signalingSocket = new WebSocket(this.config.signalingUrl);
       
       this.signalingSocket.onopen = () => {
@@ -42,10 +43,6 @@ export class WebRTCManager extends BrowserEventEmitter {
         this.isConnected = true;
         this.reconnectAttempts = 0;
         this.emit('connected');
-      };
-      
-      this.signalingSocket.onmessage = (event) => {
-        this.handleSignalingMessage(JSON.parse(event.data));
       };
       
       this.signalingSocket.onclose = () => {
@@ -60,9 +57,18 @@ export class WebRTCManager extends BrowserEventEmitter {
         }
       };
       
-      this.signalingSocket.onerror = (error) => {
+      this.signalingSocket.onerror = (error: any) => {
         console.error('❌ WebRTC signaling error:', error);
         this.emit('error', error);
+      };
+
+      this.signalingSocket.onmessage = (event) => {
+        try {
+          const message = JSON.parse(event.data);
+          this.handleSignalingMessage(message);
+        } catch (error) {
+          console.error('❌ Failed to parse signaling message:', error);
+        }
       };
       
     } catch (error) {
@@ -153,16 +159,91 @@ export class WebRTCManager extends BrowserEventEmitter {
     }
   }
 
-  // ==================== Remote Camera Management (Future) ====================
+  // ==================== Remote Camera Management ====================
 
-  async addRemoteCamera(peerId: string, name: string): Promise<string> {
-    const sourceId = `remote_${peerId}_${Date.now()}`;
+  async addRemoteCamera(sessionId: string, name: string, quality: CameraQuality = 'medium'): Promise<string> {
+    // Check if a camera with this sessionId already exists
+    const existingSource = Array.from(this.sources.values()).find(source => 
+      source.type === 'remote' && source.deviceId === sessionId
+    );
     
-    console.log(`📡 Adding remote camera: ${name} (${peerId})`);
+    if (existingSource) {
+      console.log(`📡 Remote camera already exists: ${name} (${sessionId}), updating instead`);
+      // Update existing camera properties if needed
+      existingSource.name = name;
+      const constraints = CAMERA_CONSTRAINTS[quality];
+      existingSource.width = constraints.width;
+      existingSource.height = constraints.height;
+      existingSource.fps = constraints.fps;
+      
+      // Emit camera-updated event
+      this.emit('camera-updated', existingSource.id, existingSource);
+      
+      // Re-request QR URL for existing session
+      if (this.signalingSocket && this.isConnected) {
+        console.log(`🔄 Re-requesting QR URL for existing session: ${sessionId}`);
+        this.sendSignalingMessage({
+          type: 'create-session',
+          sourceId: sessionId,
+          payload: { sessionId, name },
+          timestamp: Date.now()
+        });
+      }
+      
+      return existingSource.id;
+    }
     
-    // This will be implemented for remote cameras
-    // For now, return placeholder
-    throw new Error('Remote cameras not implemented yet');
+    const sourceId = `remote_${sessionId}_${Date.now()}`;
+    
+    console.log(`📡 Adding new remote camera: ${name} (${sessionId})`);
+    
+    try {
+      // Create peer connection for remote camera
+      const peerConnection = new RTCPeerConnection(this.config.rtcConfiguration);
+      
+      // Setup peer connection event handlers
+      this.setupPeerConnectionHandlers(peerConnection, sourceId);
+
+      // Get constraints for the quality level
+      const constraints = CAMERA_CONSTRAINTS[quality];
+
+      // Create camera source for remote camera (will get stream later from phone)
+      const source: UnifiedCameraSource = {
+        id: sourceId,
+        type: 'remote',
+        name,
+        deviceId: sessionId, // Use session ID as device identifier
+        stream: undefined, // Will be set when phone connects
+        peerConnection,
+        status: 'connecting',
+        width: constraints.width,
+        height: constraints.height,
+        fps: constraints.fps,
+        lastSeen: new Date().toISOString(),
+        errorCount: 0
+      };
+
+      this.sources.set(sourceId, source);
+      
+      console.log(`✅ Remote camera created: ${name} (${sourceId}), waiting for phone connection`);
+      this.emit('camera-added', source);
+      
+      // Send signaling message to create session via WebSocket
+      if (this.signalingSocket && this.isConnected) {
+        this.sendSignalingMessage({
+          type: 'create-session',
+          sourceId: sessionId,
+          payload: { sessionId, name },
+          timestamp: Date.now()
+        });
+      }
+      
+      return sourceId;
+      
+    } catch (error) {
+      console.error(`❌ Failed to add remote camera ${name}:`, error);
+      throw error;
+    }
   }
 
   // ==================== Camera Operations ====================
@@ -256,6 +337,74 @@ export class WebRTCManager extends BrowserEventEmitter {
     return offer;
   }
 
+  async handleIncomingOffer(sourceId: string, offer: RTCSessionDescriptionInit): Promise<void> {
+    console.log('📥 Handling incoming offer from mobile phone:', sourceId);
+    console.log('📥 Offer details:', offer);
+    console.log('🔧 Current sources:', Array.from(this.sources.keys()));
+    
+    // Find the remote camera source for this session
+    let source = this.sources.get(sourceId);
+    
+    if (!source) {
+      // If source doesn't exist, find by device ID (session ID)
+      for (const [, src] of this.sources.entries()) {
+        if (src.deviceId === sourceId && src.type === 'remote') {
+          source = src;
+          break;
+        }
+      }
+    }
+    
+    if (!source) {
+      console.warn(`⚠️ No remote camera source found for session: ${sourceId}`);
+      return;
+    }
+
+    try {
+      // Create peer connection if it doesn't exist
+      if (!source.peerConnection) {
+        source.peerConnection = new RTCPeerConnection(this.config.rtcConfiguration);
+        this.setupPeerConnectionHandlers(source.peerConnection, sourceId);
+      }
+
+      // Set remote description (the offer from mobile phone)
+      await source.peerConnection.setRemoteDescription(offer);
+      console.log('✅ Set remote description from mobile phone');
+
+      // Create answer
+      const answer = await source.peerConnection.createAnswer();
+      await source.peerConnection.setLocalDescription(answer);
+      console.log('✅ Created answer for mobile phone');
+
+      // Send answer back to mobile phone
+      if (this.signalingSocket && this.isConnected) {
+        const answerMessage = {
+          type: 'answer',
+          sourceId: sourceId,
+          payload: answer,
+          timestamp: Date.now()
+        };
+        
+        console.log('📤 Sending answer to mobile phone:', answerMessage);
+        this.signalingSocket.send(JSON.stringify(answerMessage));
+        console.log('✅ Answer sent successfully');
+      } else {
+        console.error('❌ Cannot send answer: WebSocket not connected');
+        console.log('🔧 Socket state:', this.signalingSocket ? 'exists' : 'null');
+        console.log('🔧 Is connected:', this.isConnected);
+      }
+
+      // Update source status
+      source.status = 'connecting';
+      this.emit('camera-updated', source.id, source);
+
+    } catch (error) {
+      console.error('❌ Error handling incoming offer:', error);
+      source.status = 'error';
+      this.emit('camera-updated', source.id, source);
+    }
+  }
+
   async handleStreamingAnswer(sourceId: string, answer: RTCSessionDescriptionInit): Promise<void> {
     const source = this.sources.get(sourceId);
     if (!source || !source.peerConnection) {
@@ -311,6 +460,19 @@ export class WebRTCManager extends BrowserEventEmitter {
       }
     };
 
+    // Handle incoming video tracks from mobile phone
+    peerConnection.ontrack = (event) => {
+      console.log('📹 Received video track from mobile phone:', sourceId);
+      const source = this.sources.get(sourceId);
+      if (source && event.streams[0]) {
+        source.stream = event.streams[0];
+        source.status = 'connected';
+        console.log('✅ Video stream assigned to camera source:', sourceId);
+        this.emit('camera-connected', sourceId, source.stream);
+        this.emit('camera-updated', sourceId, source);
+      }
+    };
+
     peerConnection.onicecandidateerror = (event) => {
       console.error(`ICE candidate error for ${sourceId}:`, event);
       const source = this.sources.get(sourceId);
@@ -321,15 +483,44 @@ export class WebRTCManager extends BrowserEventEmitter {
     };
   }
 
-  private handleSignalingMessage(message: SignalingMessage): void {
+  private handleSignalingMessage(message: any): void {
     console.log('📨 Received signaling message:', message.type, 'for source:', message.sourceId);
     
     switch (message.type) {
+      case 'session-created':
+        console.log('✅ Session created:', message);
+        // Handle session creation confirmation
+        const sessionId = message.sourceId;
+        const qrCodeUrl = message.payload?.qrCodeUrl;
+        
+        // Update remote camera with QR code info
+        this.sources.forEach(source => {
+          if (source.deviceId === sessionId && source.type === 'remote') {
+            source.status = 'connecting';
+            this.emit('camera-updated', source.id, source);
+          }
+        });
+        
+        // Emit session created event with QR URL and session info
+        this.emit('session-created', sessionId, qrCodeUrl, message.payload);
+        break;
+      case 'phone-connected':
+      case 'external-device-connected':
+        console.log('🌐 External device connected to session:', message.sourceId);
+        // Update the corresponding camera source status
+        this.sources.forEach(source => {
+          if (source.deviceId === message.sourceId) {
+            source.status = 'connected';
+            this.emit('camera-connected', source.id, source.stream || new MediaStream());
+          }
+        });
+        break;
       case 'offer':
         // Handle incoming offers (for remote cameras)
+        this.handleIncomingOffer(message.sourceId, message.payload);
         break;
       case 'answer':
-        this.handleStreamingAnswer(message.sourceId, message.payload.sdp);
+        this.handleStreamingAnswer(message.sourceId, message.payload);
         break;
       case 'ice-candidate':
         this.addIceCandidate(message.sourceId, message.payload.candidate);
@@ -363,7 +554,7 @@ export class WebRTCManager extends BrowserEventEmitter {
       }
     }, this.config.statsInterval);
 
-    this.statsIntervals.set(sourceId, interval);
+    this.statsIntervals.set(sourceId, interval as unknown as number);
   }
 
   private stopStatsCollection(sourceId: string): void {

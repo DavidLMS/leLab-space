@@ -5,7 +5,7 @@ import { useToast } from "@/hooks/use-toast";
 import { ArrowLeft, Square, SkipForward, RotateCcw, Play } from "lucide-react";
 import UrdfViewer from "@/components/UrdfViewer";
 import UrdfProcessorInitializer from "@/components/UrdfProcessorInitializer";
-import PhoneCameraFeed from "@/components/recording/PhoneCameraFeed";
+import RecordingCameraPanel from "@/components/recording/RecordingCameraPanel";
 import { useApi } from "@/contexts/ApiContext";
 
 interface RecordingConfig {
@@ -56,10 +56,8 @@ const Recording = () => {
   );
   const [recordingSessionStarted, setRecordingSessionStarted] = useState(false);
 
-  // QR Code and camera states
+  // QR Code and camera states (legacy - kept for potential future use)
   const [showQrModal, setShowQrModal] = useState(false);
-  const [sessionId, setSessionId] = useState<string>("");
-  const [phoneCameraConnected, setPhoneCameraConnected] = useState(false);
 
   // Redirect if no config provided
   useEffect(() => {
@@ -128,50 +126,6 @@ const Recording = () => {
     };
   }, [recordingSessionStarted, recordingConfig, navigate, toast]);
 
-  // Generate session ID when component loads
-  useEffect(() => {
-    const newSessionId = `session_${Date.now()}_${Math.random()
-      .toString(36)
-      .substr(2, 9)}`;
-    setSessionId(newSessionId);
-  }, []);
-
-  // Listen for phone camera connections
-  useEffect(() => {
-    if (!sessionId) return;
-
-    const connectToPhoneCameraWS = () => {
-      const ws = new WebSocket(`${wsBaseUrl}/ws/camera/${sessionId}`);
-
-      ws.onopen = () => {
-        console.log("Phone camera WebSocket connected");
-      };
-
-      ws.onmessage = (event) => {
-        if (event.data === "camera_connected" && !phoneCameraConnected) {
-          setPhoneCameraConnected(true);
-          toast({
-            title: "Phone Camera Connected!",
-            description: "New camera feed detected and connected successfully.",
-          });
-        }
-      };
-
-      ws.onclose = () => {
-        console.log("Phone camera WebSocket disconnected");
-        setPhoneCameraConnected(false);
-      };
-
-      ws.onerror = (error) => {
-        console.error("Phone camera WebSocket error:", error);
-      };
-
-      return ws;
-    };
-
-    const ws = connectToPhoneCameraWS();
-    return () => ws.close();
-  }, [sessionId, phoneCameraConnected, toast]);
 
   const formatTime = (seconds: number): string => {
     const mins = Math.floor(seconds / 60);
@@ -472,9 +426,9 @@ const Recording = () => {
         </div>
 
         {/* Status and Controls */}
-        <div className="grid grid-cols-1 lg:grid-cols-4 gap-6 mb-8">
-          {/* Recording Status - takes up 3 columns */}
-          <div className="lg:col-span-3 bg-gray-900 rounded-lg p-6 border border-gray-700">
+        <div className="grid grid-cols-1 lg:grid-cols-1 gap-6 mb-8">
+          {/* Recording Status - full width */}
+          <div className="bg-gray-900 rounded-lg p-6 border border-gray-700">
             {/* Status header */}
             <div className="flex items-center justify-between mb-6">
               <div>
@@ -616,25 +570,29 @@ const Recording = () => {
             </div>
           </div>
 
-          {/* Phone Camera Feed - takes up 1 column */}
-          {phoneCameraConnected && (
-            <div className="bg-gray-900 rounded-lg p-4 border border-gray-700">
-              <h3 className="text-sm font-semibold text-gray-400 mb-3">
-                Phone Camera
-              </h3>
-              <PhoneCameraFeed sessionId={sessionId} />
-            </div>
-          )}
         </div>
 
-        {/* URDF Viewer Section */}
-        <div className="bg-gray-900 rounded-lg p-6 border border-gray-700 mb-8">
-          <h2 className="text-xl font-semibold text-white mb-4">
-            Robot Visualizer
-          </h2>
-          <div className="h-96 bg-gray-800 rounded-lg overflow-hidden">
-            <UrdfViewer />
-            <UrdfProcessorInitializer />
+        {/* Robot Visualizer and Camera Section */}
+        <div className="flex flex-col lg:flex-row gap-6 mb-8">
+          {/* Robot Visualizer - flex-1 */}
+          <div className="bg-gray-900 rounded-lg p-6 border border-gray-700 flex-1">
+            <h2 className="text-xl font-semibold text-white mb-4">
+              Robot Visualizer
+            </h2>
+            <div className="h-96 bg-gray-800 rounded-lg overflow-hidden">
+              <UrdfViewer />
+              <UrdfProcessorInitializer />
+            </div>
+          </div>
+
+          {/* Camera Panel - fixed width like teleoperation */}
+          <div className="bg-gray-900 rounded-lg p-6 border border-gray-700 flex-shrink-0 lg:w-80">
+            <h2 className="text-xl font-semibold text-white mb-4">
+              Camera Visualizer
+            </h2>
+            <div className="h-96 overflow-hidden">
+              <RecordingCameraPanel />
+            </div>
           </div>
         </div>
       </div>

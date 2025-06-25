@@ -18,12 +18,16 @@ import {
   RefreshCw, 
   Wifi, 
   WifiOff,
-  Activity
+  Activity,
+  Smartphone,
+  QrCode,
+  Globe
 } from "lucide-react";
 import { useToast } from "@/hooks/use-toast";
 import { webRTCManager } from "@/utils/webrtc/WebRTCManager";
 import { UnifiedCameraSource, CameraQuality, CAMERA_CONSTRAINTS } from "@/types/webrtc";
 import { useApi } from "@/contexts/ApiContext";
+import NgrokConfigModal from "@/components/landing/NgrokConfigModal";
 
 // Legacy interface for compatibility  
 export interface CameraConfig {
@@ -57,7 +61,7 @@ const WebRTCCameraConfiguration: React.FC<WebRTCCameraConfigurationProps> = ({
   releaseStreamsRef,
   loadSavedCameras = true,
 }) => {
-  const { baseUrl, fetchWithHeaders } = useApi();
+  const { baseUrl, fetchWithHeaders, isNgrokEnabled } = useApi();
   const { toast } = useToast();
 
   // WebRTC state
@@ -69,8 +73,16 @@ const WebRTCCameraConfiguration: React.FC<WebRTCCameraConfigurationProps> = ({
   const [detectedCameras, setDetectedCameras] = useState<DetectedCamera[]>([]);
   const [selectedCameraIndex, setSelectedCameraIndex] = useState<string>("");
   const [cameraName, setCameraName] = useState("");
-  // Removed selectedQuality - will be configurable per camera after adding
   const [isLoadingCameras, setIsLoadingCameras] = useState(false);
+  
+  // External camera state
+  const [isGeneratingQR, setIsGeneratingQR] = useState(false);
+  const [externalSessionQrUrls, setExternalSessionQrUrls] = useState<Map<string, string>>(new Map());
+  const [reconnectingSessions, setReconnectingSessions] = useState<Set<string>>(new Set());
+  
+  // Ngrok modal state for external cameras
+  const [showNgrokModalForCamera, setShowNgrokModalForCamera] = useState(false);
+  const [pendingCameraName, setPendingCameraName] = useState<string>("");
 
   // WebRTC video elements refs
   const videoRefs = useRef<Map<string, HTMLVideoElement>>(new Map());
@@ -103,13 +115,23 @@ const WebRTCCameraConfiguration: React.FC<WebRTCCameraConfigurationProps> = ({
         : source
     ));
 
+    // Clean up reconnecting state for this session
+    const connectedSource = webrtcSources.find(s => s.id === sourceId);
+    if (connectedSource?.deviceId) {
+      setReconnectingSessions(prev => {
+        const newSet = new Set(prev);
+        newSet.delete(connectedSource.deviceId!);
+        return newSet;
+      });
+    }
+
     // Attach stream to video element
     const videoElement = videoRefs.current.get(sourceId);
     if (videoElement && stream) {
       videoElement.srcObject = stream;
       videoElement.play().catch(console.error);
     }
-  }, []);
+  }, [webrtcSources]);
 
   const handleCameraDisconnected = useCallback((sourceId: string) => {
     console.log("🔌 Camera disconnected:", sourceId);
@@ -129,11 +151,73 @@ const WebRTCCameraConfiguration: React.FC<WebRTCCameraConfigurationProps> = ({
     });
   }, [toast]);
 
+  const handleSessionCreated = useCallback((sessionId: string, qrUrl: string, sessionInfo?: any) => {
+    console.log("🌐 Session created with QR URL:", { sessionId, qrUrl, sessionInfo });
+    console.log("🌐 Current externalSessionQrUrls before update:", externalSessionQrUrls);
+    
+    // Always save the QR URL if we have one
+    if (qrUrl) {
+      setExternalSessionQrUrls(prev => {
+        const newMap = new Map(prev.set(sessionId, qrUrl));
+        console.log("🌐 Updated externalSessionQrUrls:", newMap);
+        return newMap;
+      });
+    }
+    
+    // If session existed and device was connected, mark as reconnecting
+    if (sessionInfo?.sessionExisted && sessionInfo?.deviceConnected) {
+      console.log("🔄 Session existed with connected device - marking as reconnecting");
+      setReconnectingSessions(prev => {
+        const newSet = new Set(prev.add(sessionId));
+        console.log("🔄 Updated reconnectingSessions:", newSet);
+        return newSet;
+      });
+    }
+  }, [externalSessionQrUrls]);
+
   const handleCameraUpdated = useCallback((sourceId: string, updatedSource: UnifiedCameraSource) => {
     console.log("🔄 Camera updated in WebRTC manager:", sourceId);
     setWebrtcSources(prev => prev.map(s => 
       s.id === sourceId ? updatedSource : s
     ));
+  }, []);
+
+  // Helper function to request QR URL for cameras that don't have it
+  const requestQRUrlForExistingCamera = useCallback(async (deviceId: string, name: string, retryCount = 0) => {
+    const maxRetries = 3;
+    
+    // Check connection state
+    if (!webRTCManager.isConnectedToSignaling()) {
+      console.log(`❌ Cannot request QR URL for ${deviceId}: not connected to signaling server`);
+      
+      // If not connected and we have retries left, wait and try again
+      if (retryCount < maxRetries) {
+        console.log(`⏳ Waiting 3 seconds before retry ${retryCount + 1}/${maxRetries} for ${deviceId}`);
+        setTimeout(() => {
+          requestQRUrlForExistingCamera(deviceId, name, retryCount + 1);
+        }, 3000);
+      } else {
+        console.log(`❌ Max retries reached for ${deviceId}, giving up`);
+      }
+      return;
+    }
+    
+    try {
+      console.log(`🔄 Checking if session exists for ${deviceId} (attempt ${retryCount + 1})`);
+      // Check if session already exists and just needs to be restored
+      await webRTCManager.addRemoteCamera(deviceId, name, "medium");
+      console.log(`✅ Successfully requested session info for ${deviceId}`);
+    } catch (error) {
+      console.error(`❌ Failed to request QR URL for ${deviceId}:`, error);
+      
+      // Retry if we have attempts left
+      if (retryCount < maxRetries) {
+        console.log(`⏳ Retrying QR URL request for ${deviceId} in 2 seconds...`);
+        setTimeout(() => {
+          requestQRUrlForExistingCamera(deviceId, name, retryCount + 1);
+        }, 2000);
+      }
+    }
   }, []);
 
   const fetchSignalingStats = useCallback(async () => {
@@ -150,7 +234,26 @@ const WebRTCCameraConfiguration: React.FC<WebRTCCameraConfigurationProps> = ({
     console.log("✅ Connected to WebRTC signaling server");
     setIsConnectedToSignaling(true);
     fetchSignalingStats();
-  }, [fetchSignalingStats]);
+    
+    // If we have external cameras without QR URLs, try to request them now
+    const externalCamerasWithoutQR = webrtcSources.filter(camera => 
+      camera.type === 'remote' && 
+      (camera.deviceId?.startsWith('external_') || camera.deviceId?.startsWith('phone_')) &&
+      camera.deviceId && !externalSessionQrUrls.get(camera.deviceId)
+    );
+    
+    if (externalCamerasWithoutQR.length > 0) {
+      console.log(`🔄 Connection established, requesting QR URLs for ${externalCamerasWithoutQR.length} external cameras`);
+      setTimeout(() => {
+        externalCamerasWithoutQR.forEach(camera => {
+          if (camera.deviceId) {
+            console.log(`🔄 Requesting QR URL for ${camera.deviceId} after connection`);
+            requestQRUrlForExistingCamera(camera.deviceId, camera.name, 0);
+          }
+        });
+      }, 1000);
+    }
+  }, [fetchSignalingStats, webrtcSources, externalSessionQrUrls, requestQRUrlForExistingCamera]);
 
   const handleWebRTCDisconnected = useCallback(() => {
     console.log("🔌 Disconnected from WebRTC signaling server");
@@ -164,7 +267,10 @@ const WebRTCCameraConfiguration: React.FC<WebRTCCameraConfigurationProps> = ({
         console.log("🚀 Initializing WebRTC Manager...");
         
         // Configure WebRTC manager
-        webRTCManager.config.signalingUrl = `${baseUrl.replace('http', 'ws')}/ws/webrtc`;
+        const signalingUrl = baseUrl.replace('http', 'ws') + '/ws/webrtc';
+        console.log('🔧 Configuring WebRTC signaling URL:', signalingUrl);
+        console.log('🔧 Base URL:', baseUrl);
+        webRTCManager.config.signalingUrl = signalingUrl;
         
         // Setup event listeners
         webRTCManager.on('camera-added', handleCameraAdded);
@@ -173,6 +279,7 @@ const WebRTCCameraConfiguration: React.FC<WebRTCCameraConfigurationProps> = ({
         webRTCManager.on('camera-disconnected', handleCameraDisconnected);
         webRTCManager.on('camera-error', handleCameraError);
         webRTCManager.on('camera-updated', handleCameraUpdated);
+        webRTCManager.on('session-created', handleSessionCreated);
         webRTCManager.on('connected', handleWebRTCConnected);
         webRTCManager.on('disconnected', handleWebRTCDisconnected);
 
@@ -180,12 +287,16 @@ const WebRTCCameraConfiguration: React.FC<WebRTCCameraConfigurationProps> = ({
         if (!webRTCManager.isConnectedToSignaling()) {
           console.log("🔗 Connecting to signaling server...");
           await webRTCManager.connect();
+          console.log("✅ Successfully connected to signaling server");
         } else {
           console.log("✅ Already connected to signaling server");
           // Set the connected state even if already connected
           setIsConnectedToSignaling(true);
           fetchSignalingStats();
         }
+        
+        // Wait a bit for connection to stabilize before loading cameras
+        await new Promise(resolve => setTimeout(resolve, 1000));
         
         // Load saved cameras if requested and no cameras exist yet
         if (loadSavedCameras && webRTCManager.getAllCameras().length === 0) {
@@ -197,6 +308,24 @@ const WebRTCCameraConfiguration: React.FC<WebRTCCameraConfigurationProps> = ({
           const existingCameras = webRTCManager.getAllCameras();
           console.log("📹 Loading existing cameras into state:", existingCameras.length);
           setWebrtcSources([...existingCameras]);
+          
+          // For existing external cameras, try to restore QR URLs
+          const externalCameras = existingCameras.filter(camera => 
+            camera.type === 'remote' && 
+            (camera.deviceId?.startsWith('external_') || camera.deviceId?.startsWith('phone_'))
+          );
+          
+          if (externalCameras.length > 0) {
+            console.log("🔄 Found existing external cameras, requesting QR URLs...");
+            setTimeout(() => {
+              externalCameras.forEach(camera => {
+                if (camera.deviceId && !externalSessionQrUrls.get(camera.deviceId)) {
+                  console.log(`🔄 Requesting QR URL for existing camera: ${camera.deviceId}`);
+                  requestQRUrlForExistingCamera(camera.deviceId, camera.name);
+                }
+              });
+            }, 2000);
+          }
         }
         
     } catch (error) {
@@ -220,6 +349,7 @@ const WebRTCCameraConfiguration: React.FC<WebRTCCameraConfigurationProps> = ({
       webRTCManager.off('camera-disconnected', handleCameraDisconnected);
       webRTCManager.off('camera-error', handleCameraError);
       webRTCManager.off('camera-updated', handleCameraUpdated);
+      webRTCManager.off('session-created', handleSessionCreated);
       
       // Also remove our connection listeners specifically
       webRTCManager.off('connected', handleWebRTCConnected);
@@ -227,7 +357,7 @@ const WebRTCCameraConfiguration: React.FC<WebRTCCameraConfigurationProps> = ({
       
       // Don't disconnect WebRTC manager as teleoperation might need it
     };
-  }, [baseUrl, loadSavedCameras, handleCameraAdded, handleCameraRemoved, handleCameraConnected, handleCameraDisconnected, handleCameraError, handleCameraUpdated, handleWebRTCConnected, handleWebRTCDisconnected]);
+  }, [baseUrl, loadSavedCameras, handleCameraAdded, handleCameraRemoved, handleCameraConnected, handleCameraDisconnected, handleCameraError, handleCameraUpdated, handleSessionCreated, handleWebRTCConnected, handleWebRTCDisconnected, requestQRUrlForExistingCamera]);
 
   // Sync WebRTC sources to parent component
   const syncToParent = useCallback(() => {
@@ -303,6 +433,16 @@ const WebRTCCameraConfiguration: React.FC<WebRTCCameraConfigurationProps> = ({
 
   // Add camera to WebRTC system
   const addCamera = async () => {
+    // Check if "Add External" option is selected
+    if (selectedCameraIndex === "external_phone") {
+      await addExternalCamera();
+    } else {
+      await addLocalCamera();
+    }
+  };
+
+  // Add local camera
+  const addLocalCamera = async () => {
     if (!selectedCameraIndex || !cameraName.trim()) {
       toast({
         title: "Missing Information",
@@ -347,7 +487,7 @@ const WebRTCCameraConfiguration: React.FC<WebRTCCameraConfigurationProps> = ({
     }
 
     try {
-      console.log(`🆕 Adding WebRTC camera: ${cameraName} (${selectedCamera.deviceId})`);
+      console.log(`🆕 Adding WebRTC local camera: ${cameraName} (${selectedCamera.deviceId})`);
       
       const sourceId = await webRTCManager.addLocalCamera(
         selectedCamera.deviceId,
@@ -368,12 +508,121 @@ const WebRTCCameraConfiguration: React.FC<WebRTCCameraConfigurationProps> = ({
       });
 
     } catch (error) {
-      console.error("❌ Failed to add camera:", error);
+      console.error("❌ Failed to add local camera:", error);
       toast({
         title: "Camera Add Failed",
         description: `Could not add camera: ${error.message}`,
         variant: "destructive",
       });
+    }
+  };
+
+  // Add external camera
+  const addExternalCamera = async () => {
+    if (!cameraName.trim()) {
+      toast({
+        title: "Missing Information",
+        description: "Please provide a name for the external camera.",
+        variant: "destructive",
+      });
+      return;
+    }
+
+    // Check if ngrok is configured before proceeding
+    if (!isNgrokEnabled) {
+      console.log("🌐 Ngrok not configured, opening ngrok modal for external camera");
+      setPendingCameraName(cameraName);
+      setShowNgrokModalForCamera(true);
+      return;
+    }
+
+    if (!isConnectedToSignaling) {
+      toast({
+        title: "Not Connected",
+        description: "Not connected to WebRTC signaling server.",
+        variant: "destructive",
+      });
+      return;
+    }
+
+    await performAddExternalCamera(cameraName);
+  };
+
+  // Core logic for adding external camera (can be called from ngrok success callback)
+  const performAddExternalCamera = async (camName: string) => {
+    setIsGeneratingQR(true);
+
+    try {
+      console.log(`🆕 Adding external camera: ${camName}`);
+      
+      // Generate unique session ID for external camera connection
+      const sessionId = `external_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+
+      // Create a remote camera source
+      const sourceId = await webRTCManager.addRemoteCamera(
+        sessionId,
+        camName.trim(),
+        "medium"
+      );
+
+      // Save to backend
+      await saveCameraToBackend(sourceId, camName, sessionId, "medium");
+
+      // Reset form
+      setCameraName("");
+      setSelectedCameraIndex("");
+
+      toast({
+        title: "External Camera Created",
+        description: `${camName} QR code generated. Scan with your device to connect.`,
+      });
+
+    } catch (error) {
+      console.error("❌ Failed to add external camera:", error);
+      toast({
+        title: "External Camera Add Failed",
+        description: `Could not create external camera: ${error.message}`,
+        variant: "destructive",
+      });
+    } finally {
+      setIsGeneratingQR(false);
+    }
+  };
+
+  // Handle successful ngrok configuration for camera creation
+  const handleNgrokConfiguredForCamera = async () => {
+    console.log("✅ Ngrok configured successfully, proceeding with camera creation");
+    setShowNgrokModalForCamera(false);
+    
+    if (pendingCameraName) {
+      await performAddExternalCamera(pendingCameraName);
+      setPendingCameraName("");
+    }
+  };
+
+  // Handle ngrok modal cancellation for camera creation
+  const handleNgrokCancelledForCamera = () => {
+    console.log("❌ Ngrok configuration cancelled, not adding camera");
+    setShowNgrokModalForCamera(false);
+    setPendingCameraName("");
+    // Don't add the camera - user cancelled the required ngrok setup
+  };
+
+  // Get local network IP for QR code generation
+  const getLocalNetworkIP = async (): Promise<string> => {
+    try {
+      // Try to get it from the current URL if it's not localhost
+      const currentHost = window.location.hostname;
+      if (currentHost !== 'localhost' && currentHost !== '127.0.0.1') {
+        return currentHost;
+      }
+
+      // Otherwise, try to detect local IP (this is a simplified approach)
+      // In production, the backend should provide this information
+      return currentHost;
+    } catch (error) {
+      console.error("Failed to get local IP:", error);
+      return window.location.hostname;
     }
   };
 
@@ -544,9 +793,30 @@ const WebRTCCameraConfiguration: React.FC<WebRTCCameraConfigurationProps> = ({
           if ((config as any).type === "webrtc" && (config as any).device_id && (config as any).source_id) {
             try {
               const quality = (config as any).quality || "medium";
+              const deviceId = (config as any).device_id;
               console.log(`🔄 Restoring WebRTC camera: ${name}`);
               
-              await webRTCManager.addLocalCamera((config as any).device_id, name, quality);
+              // Check if this is an external camera (remote) or local camera  
+              if (deviceId.startsWith('external_') || deviceId.startsWith('phone_')) {
+                // This is a remote external camera (legacy phone_ prefix supported)
+                console.log(`🔄 Restoring external camera: ${name} with deviceId: ${deviceId}`);
+                console.log(`🔄 Current externalSessionQrUrls:`, externalSessionQrUrls);
+                await webRTCManager.addRemoteCamera(deviceId, name, quality);
+                console.log(`🔄 After addRemoteCamera, externalSessionQrUrls:`, externalSessionQrUrls);
+                
+                // Wait a bit and check if QR URL was received, if not request it again
+                setTimeout(() => {
+                  if (!externalSessionQrUrls.get(deviceId)) {
+                    console.log(`⚠️ QR URL not received for ${deviceId}, requesting again...`);
+                    requestQRUrlForExistingCamera(deviceId, name, 0);
+                  } else {
+                    console.log(`✅ QR URL already available for ${deviceId}`);
+                  }
+                }, 3000);
+              } else {
+                // This is a local camera
+                await webRTCManager.addLocalCamera(deviceId, name, quality);
+              }
             } catch (error) {
               console.error(`❌ Failed to restore camera ${name}:`, error);
             }
@@ -611,7 +881,7 @@ const WebRTCCameraConfiguration: React.FC<WebRTCCameraConfigurationProps> = ({
       </div>
 
       {/* Add Camera Section */}
-      {detectedCameras.length > 0 && isConnectedToSignaling && (
+      {(detectedCameras.length > 0 || isConnectedToSignaling) && (
         <div className="bg-gray-800/50 rounded-lg p-4 space-y-4">
           <h4 className="text-md font-medium text-gray-300">Add Camera</h4>
 
@@ -643,6 +913,16 @@ const WebRTCCameraConfiguration: React.FC<WebRTCCameraConfigurationProps> = ({
                       </SelectItem>
                     );
                   })}
+                  {/* Add External Camera option at the end */}
+                  <SelectItem
+                    value="external_phone"
+                    className="text-white hover:bg-gray-700 border-t border-gray-600 mt-1"
+                  >
+                    <div className="flex items-center gap-2">
+                      
+                      Add External
+                    </div>
+                  </SelectItem>
                 </SelectContent>
               </Select>
             </div>
@@ -654,7 +934,7 @@ const WebRTCCameraConfiguration: React.FC<WebRTCCameraConfigurationProps> = ({
               <Input
                 value={cameraName}
                 onChange={(e) => setCameraName(e.target.value)}
-                placeholder="e.g., workspace_cam"
+                placeholder={selectedCameraIndex === "external_phone" ? "e.g., external_cam" : "e.g., workspace_cam"}
                 className="bg-gray-800 border-gray-700 text-white"
               />
             </div>
@@ -663,10 +943,26 @@ const WebRTCCameraConfiguration: React.FC<WebRTCCameraConfigurationProps> = ({
               <Button
                 onClick={addCamera}
                 className="bg-blue-500 hover:bg-blue-600 text-white"
-                disabled={!selectedCameraIndex || !cameraName.trim() || !isConnectedToSignaling}
+                disabled={
+                  !selectedCameraIndex || 
+                  !cameraName.trim() || 
+                  !isConnectedToSignaling ||
+                  isGeneratingQR ||
+                  (selectedCameraIndex !== "external_phone" && detectedCameras.length === 0)
+                }
+                title={`Debug: selectedCameraIndex=${selectedCameraIndex}, cameraName='${cameraName}', isConnectedToSignaling=${isConnectedToSignaling}, isGeneratingQR=${isGeneratingQR}, detectedCameras=${detectedCameras.length}`}
               >
-                <Plus className="w-4 h-4 mr-2" />
-                Add Camera
+                {isGeneratingQR ? (
+                  <>
+                    <RefreshCw className="w-4 h-4 mr-2 animate-spin" />
+                    Generating QR...
+                  </>
+                ) : (
+                  <>
+                    <Plus className="w-4 h-4 mr-2" />
+                    Add Camera
+                  </>
+                )}
               </Button>
             </div>
           </div>
@@ -685,6 +981,8 @@ const WebRTCCameraConfiguration: React.FC<WebRTCCameraConfigurationProps> = ({
               <WebRTCCameraPreview
                 key={source.id}
                 source={source}
+                externalSessionQrUrls={externalSessionQrUrls}
+                reconnectingSessions={reconnectingSessions}
                 onRemove={() => removeCamera(source.id)}
                 onUpdateSource={(updates) => {
                   updateCameraSettings(source.id, updates);
@@ -714,6 +1012,18 @@ const WebRTCCameraConfiguration: React.FC<WebRTCCameraConfigurationProps> = ({
           </p>
         </div>
       )}
+
+      {/* Ngrok Configuration Modal for External Cameras */}
+      <NgrokConfigModal
+        open={showNgrokModalForCamera}
+        onOpenChange={(open) => {
+          if (!open) {
+            handleNgrokCancelledForCamera();
+          }
+        }}
+        onSuccess={handleNgrokConfiguredForCamera}
+        isForExternalCamera={true}
+      />
     </div>
   );
 };
@@ -724,6 +1034,8 @@ interface WebRTCCameraPreviewProps {
   onRemove: () => void;
   onUpdateSource: (updates: Partial<UnifiedCameraSource>) => void;
   videoRef: (el: HTMLVideoElement | null) => void;
+  externalSessionQrUrls?: Map<string, string>;
+  reconnectingSessions?: Set<string>;
 }
 
 const WebRTCCameraPreview: React.FC<WebRTCCameraPreviewProps> = ({
@@ -731,7 +1043,60 @@ const WebRTCCameraPreview: React.FC<WebRTCCameraPreviewProps> = ({
   onRemove,
   onUpdateSource,
   videoRef,
+  externalSessionQrUrls,
+  reconnectingSessions,
 }) => {
+  const localVideoRef = useRef<HTMLVideoElement | null>(null);
+  const [forceShowQR, setForceShowQR] = useState(false);
+
+  // Handle video stream assignment separately to avoid re-renders causing flashing
+  useEffect(() => {
+    if (localVideoRef.current && source.stream && source.status === 'connected') {
+      const videoElement = localVideoRef.current;
+      
+      // Only set srcObject if it's different from current
+      if (videoElement.srcObject !== source.stream) {
+        console.log(`🎥 Setting srcObject for ${source.name}`);
+        videoElement.srcObject = source.stream;
+        videoElement.play().catch(e => {
+          // Only log if it's not the "interrupted by new load" error, which is expected
+          if (e.name !== 'AbortError') {
+            console.error(`Video play error for ${source.name}:`, e);
+          }
+        });
+      }
+    } else if (localVideoRef.current && !source.stream) {
+      // Clear srcObject if no stream
+      localVideoRef.current.srcObject = null;
+    }
+  }, [source.stream, source.status, source.name]);
+
+  // Reset forceShowQR when camera connects successfully
+  useEffect(() => {
+    if (source.status === 'connected' && forceShowQR) {
+      setForceShowQR(false);
+    }
+  }, [source.status, forceShowQR]);
+
+  // Check if this is an external camera waiting for connection
+  const isExternalCamera = source.type === 'remote' && !source.stream;
+  
+  // Logic for showing QR vs waiting for reconnection
+  const qrUrlValue = externalSessionQrUrls?.get(source.deviceId || '');
+  const isReconnecting = reconnectingSessions?.has(source.deviceId || '') || false;
+  const hasValidQrUrl = !!qrUrlValue;
+
+  // Auto-trigger ngrok modal if QR is forced but no URL available (ngrok not configured)
+  useEffect(() => {
+    if (forceShowQR && isExternalCamera && !qrUrlValue) {
+      console.log("🌐 QR forced but no URL available - ngrok needs configuration");
+      // Reset forceShowQR and trigger ngrok modal
+      setForceShowQR(false);
+      // Here we could trigger the ngrok modal, but we need access to those functions
+      // For now, let's add a note that ngrok needs to be configured
+    }
+  }, [forceShowQR, isExternalCamera, qrUrlValue]);
+
   const getStatusColor = () => {
     switch (source.status) {
       case 'connected': return 'text-green-400';
@@ -751,6 +1116,10 @@ const WebRTCCameraPreview: React.FC<WebRTCCameraPreviewProps> = ({
       default: return <Camera className="w-3 h-3" />;
     }
   };
+  
+  // Show QR for new external cameras, when forced, or when we have a valid QR URL but device hasn't connected yet
+  // Don't show QR only when it's a reconnection scenario (unless forced)
+  const shouldShowQR = isExternalCamera && source.status === 'connecting' && (!isReconnecting || forceShowQR);
 
   return (
     <div className="bg-gray-900 rounded-lg border border-gray-700 overflow-hidden">
@@ -760,12 +1129,8 @@ const WebRTCCameraPreview: React.FC<WebRTCCameraPreviewProps> = ({
           <>
             <video
               ref={(el) => {
+                localVideoRef.current = el;
                 videoRef(el);
-                if (el && source.stream) {
-                  console.log(`🎥 Setting srcObject for ${source.name}`);
-                  el.srcObject = source.stream;
-                  el.play().catch(e => console.error(`Video play error for ${source.name}:`, e));
-                }
               }}
               autoPlay
               muted
@@ -779,12 +1144,67 @@ const WebRTCCameraPreview: React.FC<WebRTCCameraPreviewProps> = ({
               </div>
             </div>
           </>
+        ) : shouldShowQR ? (
+          <div className="w-full h-full flex flex-col items-center justify-center p-4">
+            <QrCode className="w-16 h-16 text-blue-400 mb-4" />
+            <div className="text-center">
+              <p className="text-gray-400 text-xs mb-3">Scan QR or access URL from device</p>
+              <div className="bg-white p-1 rounded">
+                <QRCodePlaceholder 
+                  sessionId={source.deviceId || ''} 
+                  qrUrl={(() => {
+                    const qrUrl = externalSessionQrUrls?.get(source.deviceId || '');
+                    console.log(`🔍 Getting QR URL for deviceId '${source.deviceId}' from map:`, qrUrl);
+                    console.log(`🔍 Current externalSessionQrUrls keys:`, Array.from(externalSessionQrUrls?.keys() || []));
+                    return qrUrl;
+                  })()} 
+                />
+              </div>
+              {!qrUrlValue && forceShowQR && (
+                <p className="text-xs text-red-400 mt-2">
+                  ⚠️ ngrok must be configured to generate QR codes
+                </p>
+              )}
+              {isReconnecting && forceShowQR && (
+                <button
+                  onClick={() => setForceShowQR(false)}
+                  className="text-xs text-gray-500 hover:text-gray-400 underline mt-2"
+                >
+                  Back to reconnection mode
+                </button>
+              )}
+            </div>
+          </div>
         ) : (
           <div className="w-full h-full flex flex-col items-center justify-center">
-            <VideoOff className="w-8 h-8 text-gray-500 mb-2" />
-            <span className="text-gray-500 text-sm">
-              {source.status === 'connecting' ? 'Connecting...' : 'No Stream'}
-            </span>
+            {isExternalCamera ? (
+              <>
+                <Smartphone className="w-8 h-8 text-gray-500 mb-2" />
+                <span className="text-gray-500 text-sm">
+                  {source.status === 'connecting' ? (
+                    isReconnecting ? 'Waiting for device reconnection...' : 'Waiting for device...'
+                  ) : 'Device disconnected'}
+                </span>
+                {isReconnecting && source.status === 'connecting' && !forceShowQR && (
+                  <div className="text-xs text-gray-600 mt-1 px-4 text-center">
+                    <p>Refresh the camera page on your device to reconnect</p>
+                    <button
+                      onClick={() => setForceShowQR(true)}
+                      className="text-blue-400 hover:text-blue-300 underline mt-1"
+                    >
+                      or regenerate the QR
+                    </button>
+                  </div>
+                )}
+              </>
+            ) : (
+              <>
+                <VideoOff className="w-8 h-8 text-gray-500 mb-2" />
+                <span className="text-gray-500 text-sm">
+                  {source.status === 'connecting' ? 'Connecting...' : 'No Stream'}
+                </span>
+              </>
+            )}
           </div>
         )}
       </div>
@@ -849,6 +1269,88 @@ const WebRTCCameraPreview: React.FC<WebRTCCameraPreviewProps> = ({
           </div>
         </div>
       </div>
+    </div>
+  );
+};
+
+// QR Code Component using qrcode library
+interface QRCodePlaceholderProps {
+  sessionId: string;
+  qrUrl?: string;
+}
+
+const QRCodePlaceholder: React.FC<QRCodePlaceholderProps> = ({ sessionId, qrUrl }) => {
+  const [qrDataUrl, setQrDataUrl] = useState<string>("");
+  const [isLoading, setIsLoading] = useState(true);
+  
+  console.log(`🔍 QRCodePlaceholder render - sessionId: ${sessionId}, qrUrl: ${qrUrl}`);
+  
+  // Only use provided URL from ngrok, don't generate local HTTP URLs
+  const finalQrUrl = qrUrl;
+  
+  useEffect(() => {
+    const generateQR = async () => {
+      try {
+        setIsLoading(true);
+        if (!finalQrUrl) {
+          setQrDataUrl("");
+          setIsLoading(false);
+          return;
+        }
+        const QRCode = await import('qrcode');
+        const dataUrl = await QRCode.toDataURL(finalQrUrl, {
+          width: 128,
+          margin: 1,
+          color: {
+            dark: '#000000',
+            light: '#FFFFFF'
+          }
+        });
+        setQrDataUrl(dataUrl);
+      } catch (error) {
+        console.error('Failed to generate QR code:', error);
+      } finally {
+        setIsLoading(false);
+      }
+    };
+
+    generateQR();
+  }, [finalQrUrl]);
+  
+  if (isLoading) {
+    return (
+      <div className="w-24 h-24 bg-gray-100 border-2 border-dashed border-gray-300 flex flex-col items-center justify-center text-gray-600 text-xs p-2 rounded">
+        <RefreshCw className="w-8 h-8 mb-2 animate-spin" />
+        <p className="text-center">Generating QR...</p>
+      </div>
+    );
+  }
+  
+  return (
+    <div className="flex flex-col items-center">
+      {qrDataUrl ? (
+        <img 
+          src={qrDataUrl} 
+          alt="QR Code for phone camera connection"
+          className="w-24 h-24 rounded"
+        />
+      ) : (
+        <div className="w-24 h-24 bg-gray-100 border-2 border-dashed border-gray-300 flex flex-col items-center justify-center text-gray-600 text-xs p-1 rounded">
+          <Globe className="w-6 h-6 mb-1" />
+          <p className="text-center text-[8px] leading-tight">
+            Configure<br/>ngrok first
+          </p>
+        </div>
+      )}
+      <p className="text-center mt-2 text-[9px] text-blue-600">
+        {qrUrl ? (
+          <a href={qrUrl} target="_blank" rel="noopener noreferrer" className="underline">
+            {qrUrl.length > 30 ? `${qrUrl.substring(0, 30)}...` : qrUrl}
+          </a>
+        ) : (
+          <span className="text-gray-500 text-[8px]">Requires ngrok URL</span>
+        )}
+      </p>
     </div>
   );
 };

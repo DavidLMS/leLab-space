@@ -169,7 +169,7 @@ const WebRTCVisualizerPanel: React.FC<WebRTCVisualizerPanelProps> = ({
           console.log("🔄 WebRTC not connected, attempting connection...");
           // Configure and connect if not already connected
           if (!webRTCManager.config.signalingUrl.includes(baseUrl)) {
-            webRTCManager.config.signalingUrl = `${baseUrl.replace('http', 'ws')}/ws/webrtc`;
+            webRTCManager.config.signalingUrl = baseUrl.replace('http', 'ws') + '/ws/webrtc';
           }
           await webRTCManager.connect();
         }
@@ -238,7 +238,7 @@ const WebRTCVisualizerPanel: React.FC<WebRTCVisualizerPanelProps> = ({
     const cameraCount = getAvailableCameras().length;
     
     if (cameraCount === 0) return "";
-    if (cameraCount === 1) return "flex flex-col gap-3"; // 1 camera: single column
+    if (cameraCount === 1) return "flex flex-col gap-3 items-center"; // 1 camera: centered
     if (cameraCount === 2) return "flex flex-col gap-3"; // 2 cameras: stacked
     if (cameraCount === 3) return "flex flex-col gap-3"; // 3 cameras: single column
     if (cameraCount === 4) return "grid grid-cols-2 gap-3"; // 4 cameras: 2x2 grid
@@ -284,6 +284,7 @@ const WebRTCVisualizerPanel: React.FC<WebRTCVisualizerPanelProps> = ({
               <WebRTCCameraDisplay
                 key={source.id}
                 source={source}
+                isSingleCamera={availableCameras.length === 1}
                 videoRef={(el) => {
                   if (el) {
                     videoRefs.current.set(source.id, el);
@@ -319,11 +320,13 @@ const WebRTCVisualizerPanel: React.FC<WebRTCVisualizerPanelProps> = ({
 interface WebRTCCameraDisplayProps {
   source: UnifiedCameraSource;
   videoRef: (el: HTMLVideoElement | null) => void;
+  isSingleCamera?: boolean;
 }
 
 const WebRTCCameraDisplay: React.FC<WebRTCCameraDisplayProps> = ({
   source,
   videoRef,
+  isSingleCamera = false,
 }) => {
   const [isPlaying, setIsPlaying] = useState(false);
 
@@ -346,8 +349,15 @@ const WebRTCCameraDisplay: React.FC<WebRTCCameraDisplayProps> = ({
     console.error(`Video playback error for camera ${source.name}`);
   };
 
+  // Check if this is a remote camera (phone) waiting for connection
+  const isRemoteCamera = source.type === 'remote';
+  const shouldShowQRMessage = isRemoteCamera && !source.stream && source.status === 'connecting';
+
   return (
-    <div className="flex-1 bg-gray-900 rounded-lg border border-gray-800 flex flex-col items-center justify-center p-2 min-h-0">
+    <div className={cn(
+      "bg-gray-900 rounded-lg border border-gray-800 flex flex-col items-center justify-center p-2 min-h-0",
+      isSingleCamera ? "h-1/2 aspect-video" : "flex-1"
+    )}>
       <div className="w-full h-full flex flex-col">
         <div className="flex-1 bg-black rounded mb-2 flex items-center justify-center relative overflow-hidden">
           {source.stream && source.status === 'connected' ? (
@@ -357,7 +367,10 @@ const WebRTCCameraDisplay: React.FC<WebRTCCameraDisplayProps> = ({
                 autoPlay
                 muted
                 playsInline
-                className="w-full h-full object-cover"
+                className={cn(
+                  "w-full h-full",
+                  isSingleCamera ? "object-contain" : "object-cover"
+                )}
                 onPlay={handleVideoPlay}
                 onError={handleVideoError}
               />
@@ -377,6 +390,13 @@ const WebRTCCameraDisplay: React.FC<WebRTCCameraDisplayProps> = ({
                 </div>
               </div>
             </>
+          ) : shouldShowQRMessage ? (
+            <div className="flex flex-col items-center justify-center text-gray-500">
+              <Camera className="h-6 w-6 mb-1" />
+              <span className="text-xs text-center">
+                Scan QR in camera config
+              </span>
+            </div>
           ) : (
             <div className="flex flex-col items-center justify-center text-gray-500">
               <WifiOff className="h-6 w-6 mb-1" />

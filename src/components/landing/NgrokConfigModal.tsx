@@ -16,11 +16,15 @@ import { useToast } from "@/hooks/use-toast";
 interface NgrokConfigModalProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
+  onSuccess?: () => void | Promise<void>;
+  isForExternalCamera?: boolean;
 }
 
 const NgrokConfigModal: React.FC<NgrokConfigModalProps> = ({
   open,
   onOpenChange,
+  onSuccess,
+  isForExternalCamera = false,
 }) => {
   const {
     ngrokUrl,
@@ -36,9 +40,24 @@ const NgrokConfigModal: React.FC<NgrokConfigModalProps> = ({
   const handleSave = async () => {
     if (!inputUrl.trim()) {
       resetToLocalhost();
+      
+      // Clear external URL configuration in backend
+      try {
+        await fetch("http://localhost:8000/api/config/external-url", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({ external_url: "" }),
+        });
+        console.log("✅ Backend external URL configuration cleared");
+      } catch (error) {
+        console.warn("⚠️ Failed to clear backend external URL:", error);
+      }
+      
       toast({
         title: "Ngrok Disabled",
-        description: "Switched back to localhost mode.",
+        description: "Switched back to localhost mode for QR codes too.",
       });
       onOpenChange(false);
       return;
@@ -64,10 +83,31 @@ const NgrokConfigModal: React.FC<NgrokConfigModalProps> = ({
 
       if (testResponse.ok) {
         setNgrokUrl(cleanUrl);
+        
+        // Send ngrok URL to backend for QR code generation
+        try {
+          await fetchWithHeaders(`${cleanUrl}/api/config/external-url`, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({ external_url: cleanUrl }),
+          });
+          console.log("✅ Backend notified of ngrok URL for QR codes");
+        } catch (backendError) {
+          console.warn("⚠️ Failed to notify backend of ngrok URL:", backendError);
+        }
+        
         toast({
           title: "Ngrok Configured Successfully",
-          description: `Connected to ${cleanUrl}. All API calls will now use this URL.`,
+          description: `Connected to ${cleanUrl}. All API calls and QR codes will now use this URL.`,
         });
+        
+        // Call success callback if provided (for external camera flow)
+        if (onSuccess) {
+          await onSuccess();
+        }
+        
         onOpenChange(false);
       } else {
         throw new Error(`Server responded with status ${testResponse.status}`);
@@ -84,12 +124,27 @@ const NgrokConfigModal: React.FC<NgrokConfigModalProps> = ({
     }
   };
 
-  const handleReset = () => {
+  const handleReset = async () => {
     resetToLocalhost();
     setInputUrl("");
+    
+    // Clear external URL configuration in backend
+    try {
+      await fetch("http://localhost:8000/api/config/external-url", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ external_url: "" }),
+      });
+      console.log("✅ Backend external URL configuration cleared");
+    } catch (error) {
+      console.warn("⚠️ Failed to clear backend external URL:", error);
+    }
+    
     toast({
       title: "Reset to Localhost",
-      description: "All API calls will now use localhost:8000.",
+      description: "All API calls and QR codes will now use localhost:8000.",
     });
     onOpenChange(false);
   };
@@ -102,11 +157,13 @@ const NgrokConfigModal: React.FC<NgrokConfigModalProps> = ({
             <Globe className="w-8 h-8 text-blue-500" />
           </div>
           <DialogTitle className="text-white text-center text-xl sm:text-2xl font-bold">
-            Ngrok Configuration
+            {isForExternalCamera ? "Ngrok Required for External Camera" : "Ngrok Configuration"}
           </DialogTitle>
           <DialogDescription className="text-gray-400 text-center text-sm sm:text-base">
-            Configure ngrok tunnel for external access and phone camera
-            features.
+            {isForExternalCamera 
+              ? "External phone cameras require ngrok for HTTPS connectivity. Please configure ngrok to continue."
+              : "Configure ngrok tunnel for external access and phone camera features."
+            }
           </DialogDescription>
         </DialogHeader>
 

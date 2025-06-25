@@ -32,7 +32,7 @@ export interface UnifiedCameraSource {
 }
 
 export interface SignalingMessage {
-  type: 'offer' | 'answer' | 'ice-candidate' | 'camera-list' | 'camera-request' | 'error';
+  type: 'offer' | 'answer' | 'ice-candidate' | 'camera-list' | 'camera-request' | 'error' | 'create-session';
   sourceId: string;                     // Camera source ID
   targetId?: string;                    // Target peer (for remote)
   payload: any;                         // Message-specific data
@@ -84,7 +84,10 @@ export interface WebRTCManagerEvents {
   'camera-connected': (sourceId: string, stream: MediaStream) => void;
   'camera-disconnected': (sourceId: string) => void;
   'camera-error': (sourceId: string, error: Error) => void;
+  'camera-updated': (sourceId: string, updatedSource: UnifiedCameraSource) => void;
   'stats-updated': (sourceId: string, stats: RTCStatsReport) => void;
+  'connected': () => void;
+  'disconnected': () => void;
 }
 
 export interface WebRTCManagerConfig {
